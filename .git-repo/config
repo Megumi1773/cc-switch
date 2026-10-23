@@ -1,0 +1,12 @@
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+	worktree = /home/megumi/Github/cc-switch
+[user]
+	name = Megumi1773
+	email = lixiaojie0514@foxmail.com
+[remote "origin"]
+	url = https://github.com/Megumi1773/cc-switch.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
