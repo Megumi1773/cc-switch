@@ -467,6 +467,41 @@ pub struct CodexChatReasoningConfig {
     pub effort_levels: Option<Vec<String>>,
 }
 
+/// Claude（Claude Code / Claude Code desktop）→ OpenAI 兼容上游的思考能力描述。
+///
+/// 与 `CodexChatReasoningConfig` 对称：Codex 走 Responses→Chat，Claude 走
+/// Messages→Chat，两条路径的上游能力差异不能用同一份字段表达（Claude 侧多出
+/// 「历史 reasoning_content 能否回放」和「上游完全不产出思考时如何模拟」）。
+///
+/// 字段全部为 `Option`，`None` 表示「未声明 → 沿用内置启发式」，因此只写需要
+/// 覆盖的那几项即可；全部为空时行为与引入本结构前逐字节一致。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ClaudeChatThinkingConfig {
+    /// 上游是否接受思考输入参数（`thinking` / `output_config.effort` / `reasoning_effort`）。
+    /// `Some(false)`：发请求前全部剥离，避免严格网关 400。
+    #[serde(rename = "supportsThinking", skip_serializing_if = "Option::is_none")]
+    pub supports_thinking: Option<bool>,
+    /// 上游是否接受 `reasoning_effort` 档位。`None` 时按模型名启发式决定。
+    #[serde(rename = "supportsEffort", skip_serializing_if = "Option::is_none")]
+    pub supports_effort: Option<bool>,
+    /// 上游是否接受 assistant 历史里的 `reasoning_content` 回放。
+    /// `Some(false)`：历史 thinking 不再转成 `reasoning_content`（严格网关会拒收未知字段）。
+    #[serde(
+        rename = "acceptsReasoningHistory",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub accepts_reasoning_history: Option<bool>,
+    /// 上游完全不产出思考时，用提示词把推理写进 `<thinking>` 标签，
+    /// 再由代理的 inline think 拆分器还原成 Anthropic thinking 块。
+    #[serde(rename = "emulateInline", skip_serializing_if = "Option::is_none")]
+    pub emulate_inline: Option<bool>,
+    /// 声明性字段：上游思考回传位置
+    /// （`auto` / `reasoning_content` / `reasoning` / `reasoning_details` / `none`）。
+    /// 响应侧提取走 `extract_reasoning_value_text` 的穷举，不读本字段。
+    #[serde(rename = "outputFormat", skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+}
+
 /// Local proxy request overrides applied after route/protocol transforms.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LocalProxyRequestOverrides {
@@ -572,6 +607,13 @@ pub struct ProviderMeta {
     /// Codex Responses -> Chat Completions reasoning capability metadata.
     #[serde(rename = "codexChatReasoning", skip_serializing_if = "Option::is_none")]
     pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
+    /// Claude Messages -> OpenAI Chat/Responses thinking capability metadata.
+    ///
+    /// 典型场景：上游是 OpenAI 格式、但不接受任何思考输入的中转站（如
+    /// `ai.wesign.top`）。声明后代理会剥离思考输入参数，并可选地以提示词模拟
+    /// 思考，把 `<thinking>` 拆成 Claude Code 的 thinking 块。
+    #[serde(rename = "claudeChatThinking", skip_serializing_if = "Option::is_none")]
+    pub claude_chat_thinking: Option<ClaudeChatThinkingConfig>,
     /// Codex → Anthropic path: whether to emulate the Claude Code client
     /// (User-Agent / anthropic-beta / x-app + injecting the Claude Code system
     /// prompt first line). Disabled by default; only an explicit `true` enables it.

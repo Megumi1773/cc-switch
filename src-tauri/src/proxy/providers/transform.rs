@@ -218,7 +218,29 @@ pub fn make_default_adaptive_thinking_explicit(body: &mut Value, client_model: O
 /// 消费者），但保留其转换逻辑与下方测试套件，供代理转换路径复用 / 未来接线。
 #[allow(dead_code)]
 pub fn anthropic_to_openai(body: Value) -> Result<Value, ProxyError> {
-    anthropic_to_openai_with_reasoning_content(body, false)
+    anthropic_to_openai_with_policy(body, ChatRequestPolicy::default())
+}
+
+/// Anthropic → OpenAI Chat 转换的思考相关策略。
+///
+/// 由供应商侧的 `chat_thinking_policy` 解析结果填充：中转站不接受思考输入时，
+/// `reasoning_effort` 一律不注入；不接受历史 `reasoning_content` 时，历史 thinking
+/// 块直接丢弃（转成普通 assistant 文本内容）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatRequestPolicy {
+    /// 历史 thinking 是否转成 `reasoning_content` 回放（DeepSeek/MiMo 需要）。
+    pub preserve_reasoning_content: bool,
+    /// 是否允许按模型能力注入 `reasoning_effort`。
+    pub emit_reasoning_effort: bool,
+}
+
+impl Default for ChatRequestPolicy {
+    fn default() -> Self {
+        Self {
+            preserve_reasoning_content: false,
+            emit_reasoning_effort: true,
+        }
+    }
 }
 
 /// Anthropic 请求 → OpenAI Chat Completions 请求
@@ -226,10 +248,29 @@ pub fn anthropic_to_openai(body: Value) -> Result<Value, ProxyError> {
 /// `preserve_reasoning_content` 仅用于明确需要 DeepSeek/MiMo
 /// `reasoning_content` 兼容字段的 provider。默认转换保持通用 OpenAI-compatible
 /// 请求体，避免向严格后端发送未知字段。
+///
+/// 生产路径已改为 [`anthropic_to_openai_with_policy`]（需要同时表达
+/// 「不发 reasoning_effort」）；本函数保留给只需要一个开关的调用点与测试。
+#[allow(dead_code)]
 pub fn anthropic_to_openai_with_reasoning_content(
     body: Value,
     preserve_reasoning_content: bool,
 ) -> Result<Value, ProxyError> {
+    anthropic_to_openai_with_policy(
+        body,
+        ChatRequestPolicy {
+            preserve_reasoning_content,
+            ..ChatRequestPolicy::default()
+        },
+    )
+}
+
+/// Anthropic 请求 → OpenAI Chat Completions 请求（带完整思考策略）
+pub fn anthropic_to_openai_with_policy(
+    body: Value,
+    policy: ChatRequestPolicy,
+) -> Result<Value, ProxyError> {
+    let preserve_reasoning_content = policy.preserve_reasoning_content;
     let mut result = json!({});
 
     // NOTE: 模型映射由上游统一处理（proxy::model_mapper），格式转换层只做结构转换。
@@ -299,7 +340,7 @@ pub fn anthropic_to_openai_with_reasoning_content(
     }
 
     // Map Anthropic thinking → OpenAI reasoning_effort
-    if supports_reasoning_effort(model) {
+    if policy.emit_reasoning_effort && supports_reasoning_effort(model) {
         if let Some(effort) = resolve_reasoning_effort(&body) {
             result["reasoning_effort"] = json!(effort);
         }
@@ -654,11 +695,12 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
     let mut content = Vec::new();
     let mut has_tool_use = false;
 
-    // DeepSeek provider 会把思考内容放在 message.reasoning_content。
-    if let Some(reasoning_content) = message.get("reasoning_content").and_then(|r| r.as_str()) {
-        if !reasoning_content.is_empty() {
-            content.push(json!({"type": "thinking", "thinking": reasoning_content}));
-        }
+    // 思考内容：DeepSeek 系回 `reasoning_content`，OpenRouter/Kimi 回 `reasoning`
+    // （字符串或对象），MiniMax `reasoning_split` 与 OpenRouter 还回
+    // `reasoning_details` 数组。三个位置统一走 Codex Chat 路径同一套穷举提取，
+    // 避免 Claude 路径只认 `reasoning_content` 时把 OpenAI 格式的思考整段丢掉。
+    if let Some(reasoning) = super::codex_chat_common::extract_reasoning_field_text(message) {
+        content.push(json!({"type": "thinking", "thinking": reasoning}));
     }
 
     // 文本/拒绝内容。正文开头内联的 <think>/<thinking> 块（DeepSeek 系、MiniMax M3 等
@@ -1193,6 +1235,85 @@ mod tests {
         assert_eq!(msg["reasoning_content"], "I should call the tool.");
         assert!(msg.get("tool_calls").is_some());
         assert_eq!(msg["tool_calls"][0]["id"], "call_123");
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_reads_reasoning_details_and_object_reasoning() {
+        // 非流式路径以前只认 `reasoning_content`：OpenRouter/MiniMax 的
+        // `reasoning_details` 数组、以及对象形态的 `reasoning` 都会被整段丢掉，
+        // 于是 Claude Code 里看不到思考。三条形态都要映射成 thinking 块。
+        let details = json!({
+            "id": "chatcmpl_details",
+            "model": "minimax-m2.7",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_details": [{"type": "reasoning.text", "text": "先看日志。"}],
+                    "content": "结论"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let result = openai_to_anthropic(details).unwrap();
+        assert_eq!(result["content"][0]["type"], "thinking");
+        assert_eq!(result["content"][0]["thinking"], "先看日志。");
+        assert_eq!(result["content"][1]["text"], "结论");
+
+        let object_reasoning = json!({
+            "id": "chatcmpl_obj",
+            "model": "openrouter/glm-5.2",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning": {"content": "对象形态的思考"},
+                    "content": "答案"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let result = openai_to_anthropic(object_reasoning).unwrap();
+        assert_eq!(result["content"][0]["type"], "thinking");
+        assert_eq!(result["content"][0]["thinking"], "对象形态的思考");
+    }
+
+    #[test]
+    fn test_chat_policy_can_suppress_effort_and_reasoning_history() {
+        // 不支持思考输入的中转站：既不能注入 reasoning_effort，也不能回放
+        // reasoning_content（严格网关把它们当非法字段）。默认策略保持旧行为。
+        let input = json!({
+            "model": "gpt-5.4",
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "I should call the tool."},
+                    {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {}}
+                ]
+            }]
+        });
+
+        let suppressed = anthropic_to_openai_with_policy(
+            input.clone(),
+            ChatRequestPolicy {
+                preserve_reasoning_content: false,
+                emit_reasoning_effort: false,
+            },
+        )
+        .unwrap();
+        assert!(suppressed.get("reasoning_effort").is_none());
+        assert!(suppressed["messages"][0].get("reasoning_content").is_none());
+
+        let legacy = anthropic_to_openai_with_policy(
+            input,
+            ChatRequestPolicy {
+                preserve_reasoning_content: true,
+                emit_reasoning_effort: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy["reasoning_effort"], "low");
+        assert_eq!(legacy["messages"][0]["reasoning_content"], "I should call the tool.");
     }
 
     #[test]

@@ -422,11 +422,34 @@ pub fn transform_claude_request_for_api_format(
             Ok(result)
         }
         "openai_chat" => {
-            let preserve_reasoning_content =
-                should_preserve_reasoning_content_for_openai_chat(provider, &body);
-            let mut result = super::transform::anthropic_to_openai_with_reasoning_content(
+            // 思考能力适配：有的 OpenAI 格式中转站（如 ai.wesign.top）根本不接受
+            // 思考输入。先按供应商策略剥离 `thinking` / `output_config` /
+            // `reasoning_effort`，必要时注入 `<thinking>` 模拟提示词，再做结构转换。
+            let thinking_policy =
+                super::claude_chat_thinking::resolve_claude_chat_thinking_policy(provider);
+            let mut body = body;
+            let applied = super::claude_chat_thinking::apply_request_thinking_policy(
+                &mut body,
+                &thinking_policy,
+            );
+            if applied.changed() {
+                log::info!(
+                    "[Claude/Chat] thinking policy applied: strip_thinking={}, strip_effort={}, emulate_inline={}, provider={}",
+                    applied.removed_thinking,
+                    applied.removed_effort,
+                    applied.injected_emulation_prompt,
+                    provider.id
+                );
+            }
+            let preserve_reasoning_content = thinking_policy
+                .reasoning_history_allowed()
+                .unwrap_or_else(|| should_preserve_reasoning_content_for_openai_chat(provider, &body));
+            let mut result = super::transform::anthropic_to_openai_with_policy(
                 body,
-                preserve_reasoning_content,
+                super::transform::ChatRequestPolicy {
+                    preserve_reasoning_content,
+                    emit_reasoning_effort: thinking_policy.effort_allowed(),
+                },
             )?;
             // Inject prompt_cache_key only if explicitly configured in meta
             if let Some(key) = provider
@@ -2382,6 +2405,64 @@ mod tests {
         let msg = &transformed["messages"][0];
         assert_eq!(msg["reasoning_content"], "I should call the tool.");
         assert!(msg.get("tool_calls").is_some());
+    }
+
+    /// 站点级适配（ai.wesign.top）：上游不接受任何思考输入 → 请求里不留
+    /// `thinking` / `output_config` / `reasoning_effort` / 历史 `reasoning_content`，
+    /// 同时注入 `<thinking>` 模拟提示词，让响应侧有东西可拆。
+    #[test]
+    fn test_wesign_provider_strips_thinking_inputs_and_injects_emulation_prompt() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://ai.wesign.top/v1",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-test"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                ..Default::default()
+            },
+        );
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "output_config": {"effort": "high"},
+            "system": "You are Claude Code.",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "earlier reasoning"},
+                        {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]
+                },
+                {"role": "user", "content": "go on"}
+            ]
+        });
+
+        let transformed =
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+                .unwrap();
+
+        // 不注入 effort（模型名不在 o-series/gpt-5 白名单里也一并锁死）
+        assert!(transformed.get("reasoning_effort").is_none());
+        assert!(transformed.get("thinking").is_none());
+        // 历史不再回放 reasoning_content
+        let assistant = &transformed["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        assert!(assistant.get("reasoning_content").is_none());
+        assert!(assistant.get("tool_calls").is_some());
+        // system 里带上了模拟提示词
+        assert!(transformed["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<thinking>"));
     }
 
     #[test]

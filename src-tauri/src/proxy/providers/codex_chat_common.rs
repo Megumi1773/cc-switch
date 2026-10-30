@@ -47,6 +47,22 @@ fn extract_reasoning_details_text(value: &Value) -> Option<String> {
     }
 }
 
+/// 从**单个字段值**里取思考文本。
+///
+/// 上游把思考放在 `reasoning` 时，可能给字符串，也可能给对象
+/// （`{content|text|summary}`）；`reasoning_details` 则可能是字符串、对象或
+/// `[{type, text}]` 数组。流式路径按字段逐个取值时需要这层归一化——以前
+/// `Delta.reasoning` 被声明成 `String`，遇到对象形态会让整个 chunk 反序列化失败，
+/// 连同正文一起被丢掉。
+pub(crate) fn extract_reasoning_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => (!text.is_empty()).then(|| text.to_string()),
+        Value::Array(_) => extract_reasoning_details_text(value),
+        Value::Object(_) => extract_reasoning_details_text(value),
+        _ => None,
+    }
+}
+
 fn extract_reasoning_detail_part_text(value: &Value) -> Option<String> {
     for key in ["text", "content", "summary"] {
         if let Some(text) = value.get(key).and_then(|v| v.as_str()) {

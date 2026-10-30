@@ -167,6 +167,21 @@ export interface CodexChatReasoning {
 
 export type PromptCacheRoutingMode = "auto" | "enabled" | "disabled";
 
+// Claude（Claude Code / Claude Code desktop）→ OpenAI Chat 的思考能力声明。
+// 与 codexChatReasoning 对称；只写需要覆盖的项，缺省沿用内置站点规则/现状行为。
+export interface ClaudeChatThinking {
+  // 上游是否接受思考输入参数（thinking / output_config / reasoning_effort）。false = 发请求前全部剥离
+  supportsThinking?: boolean;
+  // 上游是否接受 reasoning_effort 档位
+  supportsEffort?: boolean;
+  // 上游是否接受 assistant 历史里的 reasoning_content 回放
+  acceptsReasoningHistory?: boolean;
+  // 上游不产出思考时，用提示词让模型把推理写进 <thinking> 标签
+  emulateInline?: boolean;
+  // 声明性：思考回传位置（reasoning_content / reasoning / reasoning_details / auto / none）
+  outputFormat?: string;
+}
+
 export interface LocalProxyRequestOverrides {
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
@@ -218,6 +233,8 @@ export interface ProviderMeta {
   codexFastMode?: boolean;
   // Codex Responses -> Chat Completions reasoning capability metadata
   codexChatReasoning?: CodexChatReasoning;
+  // Claude Messages -> OpenAI Chat thinking capability metadata
+  claudeChatThinking?: ClaudeChatThinking;
   // Codex → Anthropic path: emulate the Claude Code client (disabled by default; only an explicit true enables it)
   impersonateClaudeCode?: boolean;
   // Codex → Anthropic path: override the Anthropic max_tokens (output ceiling).

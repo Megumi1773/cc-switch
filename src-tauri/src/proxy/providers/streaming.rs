@@ -34,11 +34,25 @@ struct StreamChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
-    // OpenRouter/Kimi/其它 使用 reasoning，DeepSeek 使用 reasoning_content
+    // OpenRouter/Kimi/其它 使用 reasoning，DeepSeek 使用 reasoning_content。
+    // 声明成 Value 而非 String：部分上游把 reasoning 给成对象
+    // （`{content|text|summary}`），用 String 接会让整个 chunk 反序列化失败，
+    // 连正文一起丢；取值统一走 `extract_reasoning_value_text`。
     #[serde(default, alias = "reasoning_content")]
-    reasoning: Option<String>,
+    reasoning: Option<Value>,
+    // OpenRouter / MiniMax(`reasoning_split`) 的数组形态。
+    #[serde(default)]
+    reasoning_details: Option<Value>,
     #[serde(default)]
     tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+/// 取一个 delta 里的思考文本（`reasoning` 优先，其次 `reasoning_details`）。
+fn delta_reasoning_text(delta: &Delta) -> Option<String> {
+    [delta.reasoning.as_ref(), delta.reasoning_details.as_ref()]
+        .into_iter()
+        .flatten()
+        .find_map(super::codex_chat_common::extract_reasoning_value_text)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -395,15 +409,12 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                         // 导致单个 chunk 内 text/thinking 块被反复关闭重开，正文碎片化。
                                         // 非流式路径 openai_to_anthropic 已对 reasoning_content 做同样的空值过滤，
                                         // 此处与之保持一致（也与下方 content 分支的 !content.is_empty() 对称）。
-                                        if let Some(reasoning) = choice
-                                            .delta
-                                            .reasoning
-                                            .as_ref()
-                                            .filter(|r| !r.is_empty())
-                                        {
+                                        // 取值同时覆盖 reasoning / reasoning_content / reasoning_details
+                                        // 三种形态，空值由 `delta_reasoning_text` 过滤。
+                                        if let Some(reasoning) = delta_reasoning_text(&choice.delta) {
                                             for sse_data in non_tool_block_events(
                                                 "thinking",
-                                                reasoning,
+                                                &reasoning,
                                                 &mut next_content_index,
                                                 &mut current_non_tool_block_type,
                                                 &mut current_non_tool_block_index,
@@ -1597,6 +1608,31 @@ mod tests {
         assert_eq!(
             collect_delta_text(&events, "text_delta", "/delta/text"),
             "答案是 42"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_details_array_and_object_reasoning_map_to_thinking() {
+        // OpenRouter / MiniMax(reasoning_split) 把思考给在 `reasoning_details` 数组里，
+        // 另有上游把 `reasoning` 给成对象。修复前 Delta.reasoning 是 String，
+        // 后一种形态会让整个 chunk 反序列化失败（正文一起丢）；前一种则完全不读。
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl_details\",\"model\":\"minimax-m2.7\",\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"先读日志。\"}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_details\",\"model\":\"minimax-m2.7\",\"choices\":[{\"delta\":{\"reasoning\":{\"content\":\"再看配置。\"}}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_details\",\"model\":\"minimax-m2.7\",\"choices\":[{\"delta\":{\"content\":\"结论\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_details\",\"model\":\"minimax-m2.7\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+
+        assert_eq!(
+            collect_delta_text(&events, "thinking_delta", "/delta/thinking"),
+            "先读日志。再看配置。"
+        );
+        assert_eq!(
+            collect_delta_text(&events, "text_delta", "/delta/text"),
+            "结论"
         );
     }
 
