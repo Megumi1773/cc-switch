@@ -398,12 +398,28 @@ pub fn transform_claude_request_for_api_format(
             // Codex OAuth (ChatGPT Plus/Pro 反代) 需要在请求体里强制 store: false
             // + include: ["reasoning.encrypted_content"]，由 transform 层统一处理。
             let codex_fast_mode = provider.codex_fast_mode_enabled();
+            // 模型名白名单只覆盖 OpenAI 系；供应商显式声明支持 effort 时（如 wesign
+            // 上的 DeepSeek），按客户端开启的思考档位补发 `reasoning.effort`。
+            let requested_effort = super::claude_chat_thinking::resolve_claude_chat_thinking_policy(
+                provider,
+            )
+            .supports_effort
+            .filter(|allowed| *allowed)
+            .and_then(|_| super::transform::resolve_reasoning_effort(&body));
             let mut result = super::transform_responses::anthropic_to_responses(
                 body,
                 cache_key,
                 is_codex_oauth,
                 codex_fast_mode,
             )?;
+            if let Some(effort) = requested_effort {
+                log::info!(
+                    "[Claude/Responses] reasoning effort from thinking config: {}, provider={}",
+                    effort,
+                    provider.id
+                );
+                result["reasoning"] = json!({ "effort": effort });
+            }
             if provider.is_xai_oauth() {
                 const REASONING_MARKER: &str = "reasoning.encrypted_content";
                 let mut include = result
@@ -1852,6 +1868,46 @@ mod tests {
         assert_eq!(transformed["model"], "gpt-5.4");
         assert!(transformed.get("input").is_some());
         assert!(transformed.get("max_output_tokens").is_some());
+    }
+
+    #[test]
+    fn responses_forwards_thinking_as_reasoning_effort_only_for_declaring_providers() {
+        let thinking_body = |model: &str| {
+            json!({
+                "model": model,
+                "max_tokens": 1024,
+                "thinking": { "type": "enabled", "budget_tokens": 8000 },
+                "messages": [{ "role": "user", "content": "hi" }]
+            })
+        };
+
+        // wesign 声明支持 effort：DeepSeek 不在模型名白名单里，也要按思考档位发出去
+        let wesign = create_provider(json!({
+            "env": { "ANTHROPIC_BASE_URL": "https://ai.wesign.top/v1" }
+        }));
+        let transformed = transform_claude_request_for_api_format(
+            thinking_body("deepseek-v4.1-flash"),
+            &wesign,
+            "openai_responses",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(transformed["reasoning"]["effort"], "medium");
+
+        // 未声明的供应商保持旧行为：不认识 effort 的上游不会收到该字段
+        let generic = create_provider(json!({
+            "env": { "ANTHROPIC_BASE_URL": "https://api.example.com/v1" }
+        }));
+        let transformed = transform_claude_request_for_api_format(
+            thinking_body("deepseek-v4.1-flash"),
+            &generic,
+            "openai_responses",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(transformed.get("reasoning").is_none());
     }
 
     #[test]

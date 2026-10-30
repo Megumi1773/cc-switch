@@ -127,10 +127,11 @@ fn builtin_policy(provider: &Provider) -> ClaudeChatThinkingPolicy {
     if base_url.contains(WESIGN_HOST) || name.contains("wesign") {
         return ClaudeChatThinkingPolicy {
             supports_thinking_input: Some(false),
-            supports_effort: Some(false),
+            // 实测该站接受 `reasoning_effort`（Chat）/ `reasoning.effort`（Responses），
+            // 并要求时才回 thinking，不能再当它不支持 effort。
+            supports_effort: Some(true),
             accepts_reasoning_history: Some(false),
-            // 站点不产出思考，只能靠提示词模拟，否则 Claude Code desktop 的
-            // 思考开关点了也是空白。
+            // Chat 侧仍靠提示词模拟：剥离 `thinking` 后没有 effort 信号可发。
             emulate_inline: Some(true),
             output_format: Some("auto".to_string()),
         };
@@ -298,7 +299,7 @@ mod tests {
     fn wesign_is_recognised_as_thinking_input_unsupported() {
         let policy = resolve_claude_chat_thinking_policy(&wesign_provider());
         assert!(!policy.thinking_input_allowed());
-        assert!(!policy.effort_allowed());
+        assert!(policy.effort_allowed());
         assert_eq!(policy.reasoning_history_allowed(), Some(false));
         assert!(policy.emulates_inline());
     }
@@ -333,7 +334,7 @@ mod tests {
         ));
         // 显式声明优先于内置规则，其余字段仍沿用内置值
         assert!(policy.thinking_input_allowed());
-        assert!(!policy.effort_allowed());
+        assert!(policy.effort_allowed());
         assert!(!policy.emulates_inline());
     }
 
